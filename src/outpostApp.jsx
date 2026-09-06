@@ -4,7 +4,7 @@ import {
   ThumbsUp, Send, LogOut, Loader2, AlertCircle, Lock, Search, Swords,
   Info, CheckCircle2, Pencil, ArrowLeft, Sparkles
 } from "lucide-react";
-
+import { kv } from '@vercel/kv';
 /* ============================================================================
    CONSTANTS
 ============================================================================ */
@@ -242,47 +242,34 @@ function replayPGN(pgn) {
 
 async function storageGet(key, shared) {
   const k = `${shared}:${key}`;
-  const val = localStorage.getItem(k);
-  if (!val) return null;
-  try {
-    return JSON.parse(val);
-  } catch {
-    return val;
-  }
+  // Vercel KV automatically parses JSON data upon retrieval
+  const val = await kv.get(k);
+  return val ?? null;
 }
 
 async function storageSet(key, value, shared) {
   const k = `${shared}:${key}`;
-  // Convert objects/arrays to a string before saving
-  const serializedValue = typeof value === 'object' && value !== null 
-    ? JSON.stringify(value) 
-    : value;
-
-  localStorage.setItem(k, serializedValue);
+  // Vercel KV automatically serializes JavaScript objects/arrays
+  await kv.set(k, value);
   return { key, value, shared };
 }
 
 async function storageList(prefix, shared) {
   const namespace = `${shared}:${prefix}`;
-  const keys = [];
-
-  for (let i = 0; i < localStorage.length; i++) {
-    const k = localStorage.key(i);
-    if (k && k.startsWith(namespace)) {
-      const actualKey = k.slice(`${shared}:`.length);
-      keys.push(actualKey);
-    }
-  }
-
-  return keys;
+  // Retrieve keys matching the namespace pattern
+  const keys = await kv.keys(`${namespace}*`);
+  
+  // Strip the "shared:" prefix to match your original output format
+  const prefixLength = `${shared}:`.length;
+  return keys.map((k) => k.slice(prefixLength));
 }
 
 async function storageDelete(key, shared) {
   const k = `${shared}:${key}`;
-  const val = localStorage.getItem(k);
+  // kv.del returns the number of keys that were removed (1 if it existed, 0 if not)
+  const deletedCount = await kv.del(k);
   
-  if (val !== null) {
-    localStorage.removeItem(k);
+  if (deletedCount > 0) {
     return { key, shared };
   }
   
