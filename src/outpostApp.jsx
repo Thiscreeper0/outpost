@@ -4,7 +4,8 @@ import {
   ThumbsUp, Send, LogOut, Loader2, AlertCircle, Lock, Search, Swords,
   Info, CheckCircle2, Pencil, ArrowLeft, Sparkles
 } from "lucide-react";
-import { kv } from '@vercel/kv';
+import { Redis } from '@upstash/redis';
+const kv = Redis.fromEnv(); // reads UPSTASH_REDIS_REST_URL / TOKEN from env
 /* ============================================================================
    CONSTANTS
 ============================================================================ */
@@ -240,40 +241,27 @@ function replayPGN(pgn) {
    STORAGE HELPERS  (shared = visible to everyone who opens this artifact)
 ============================================================================ */
 
+async function callStorage(body) {
+  const res = await fetch('/api/storage', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error('Storage request failed');
+  return res.json();
+}
+
 async function storageGet(key, shared) {
-  const k = `${shared}:${key}`;
-  // Vercel KV automatically parses JSON data upon retrieval
-  const val = await kv.get(k);
-  return val ?? null;
+  return callStorage({ action: 'get', key, shared });
 }
-
 async function storageSet(key, value, shared) {
-  const k = `${shared}:${key}`;
-  // Vercel KV automatically serializes JavaScript objects/arrays
-  await kv.set(k, value);
-  return { key, value, shared };
+  return callStorage({ action: 'set', key, value, shared });
 }
-
 async function storageList(prefix, shared) {
-  const namespace = `${shared}:${prefix}`;
-  // Retrieve keys matching the namespace pattern
-  const keys = await kv.keys(`${namespace}*`);
-  
-  // Strip the "shared:" prefix to match your original output format
-  const prefixLength = `${shared}:`.length;
-  return keys.map((k) => k.slice(prefixLength));
+  return callStorage({ action: 'list', prefix, shared });
 }
-
 async function storageDelete(key, shared) {
-  const k = `${shared}:${key}`;
-  // kv.del returns the number of keys that were removed (1 if it existed, 0 if not)
-  const deletedCount = await kv.del(k);
-  
-  if (deletedCount > 0) {
-    return { key, shared };
-  }
-  
-  return null;
+  return callStorage({ action: 'delete', key, shared });
 }
 
 const gameKey = (id) => `games:${id}`;
