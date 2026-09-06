@@ -4,8 +4,6 @@ import {
   ThumbsUp, Send, LogOut, Loader2, AlertCircle, Lock, Search, Swords,
   Info, CheckCircle2, Pencil, ArrowLeft, Sparkles
 } from "lucide-react";
-import { Redis } from '@upstash/redis';
-const kv = Redis.fromEnv(); // reads UPSTASH_REDIS_REST_URL / TOKEN from env
 /* ============================================================================
    CONSTANTS
 ============================================================================ */

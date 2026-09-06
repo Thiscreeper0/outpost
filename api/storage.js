@@ -1,5 +1,10 @@
-import { Redis } from '@upstash/redis';
-const kv = Redis.fromEnv();
+
+import { Redis } from '@upstash/redis'
+
+export const redis = new Redis({
+  url: process.env.KV_REST_API_URL,
+  token: process.env.KV_REST_API_TOKEN,
+})
 
 export default async function handler(req, res) {
   const { action, key, prefix, shared, value } = req.body ?? req.query;
