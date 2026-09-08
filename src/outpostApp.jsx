@@ -15,7 +15,7 @@ const MIN_REVIEW_CHARS = 50;
 
 const WHITE_GLYPH = { P: "♙", N: "♘", B: "♗", R: "♖", Q: "♕", K: "♔" };
 const BLACK_GLYPH = { P: "♟", N: "♞", B: "♝", R: "♜", Q: "♛", K: "♚" };
-const localStore = new Map();
+const localStor = new Map();
 const RATING_TIERS = [
   { max: 999, label: "Club", color: "#8B8578" },
   { max: 1399, label: "Intermediate", color: "#4C7A5D" },
@@ -516,6 +516,8 @@ function GapNotice({ icon, children }) {
 ============================================================================ */
 
 function ConnectScreen({ onConnect, remembered }) {
+  const [verifying, setVerifying] = useState(false);
+  const [oauthError, setOauthError] = useState('');
   const [platform, setPlatform] = useState(remembered?.platform || "lichess");
   const [username, setUsername] = useState(remembered?.username || "");
   const [status, setStatus] = useState("idle");
@@ -524,7 +526,54 @@ function ConnectScreen({ onConnect, remembered }) {
   const [chosenVariant, setChosenVariant] = useState(null);
   const [manualRating, setManualRating] = useState("");
   const [manualLabel, setManualLabel] = useState("blitz");
-
+  const startOAuth = async (platform) => {
+  setVerifying(true);
+  setOauthError('');
+  try {
+    const res = await fetch('/api/storage', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'oauth_authorize', platform }),
+    });
+    const data = await res.json();
+    if (!data.authUrl) throw new Error('No auth URL returned');
+    // Open popup
+    const width = 500, height = 600;
+    const left = (window.screen.width - width) / 2;
+    const top = (window.screen.height - height) / 2;
+    const popup = window.open(data.authUrl, 'oauth', `width=${width},height=${height},left=${left},top=${top}`);
+    // Poll for completion – we'll use message from callback
+    window.addEventListener('message', async (event) => {
+      if (event.origin !== window.location.origin) return;
+      if (event.data.type === 'oauth_callback') {
+        const { code, platform } = event.data;
+        const verifyRes = await fetch('/api/storage', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'oauth_callback', code, platform }),
+        });
+        const verifiedData = await verifyRes.json();
+        if (!verifyRes.ok) throw new Error(verifiedData.error || 'Verification failed');
+        // Merge verified data with found profile (ratings, etc.)
+        const updatedFound = {
+          ...found,
+          usernameDisplay: verifiedData.usernameDisplay,
+          variants: verifiedData.variants,
+          verified: true,
+        };
+        setFound(updatedFound);
+        const top = verifiedData.top || pickPrimaryVariant(verifiedData.variants);
+        setChosenVariant(top);
+        setVerifying(false);
+        popup.close();
+        // Optionally auto‑confirm
+        }
+      });
+    } catch (e) {
+      setOauthError(e.message);
+      setVerifying(false);
+    }
+  };
   const lookup = async () => {
     if (!username.trim()) { setError("Enter a username first."); return; }
     setStatus("checking");
@@ -535,6 +584,7 @@ function ConnectScreen({ onConnect, remembered }) {
       const top = pickPrimaryVariant(profile.variants);
       setChosenVariant(top);
       setStatus("found");
+      
     } catch (e) {
       setError(e.message || "Couldn't reach that platform right now.");
       setStatus("error");
@@ -622,12 +672,21 @@ function ConnectScreen({ onConnect, remembered }) {
                   <span className="variant-chip-label">{v.variant}</span>
                   <span className="variant-chip-rating">{v.rating}</span>
                 </button>
+                
               ))}
             </div>
             <p className="connect-found-hint">This rating decides who you can review and who reviews you. Pick the mode you play most.</p>
             <button className="btn-primary btn-block" onClick={confirmFound}>
               Enter Outpost as {found.usernameDisplay} ({chosenVariant?.rating})
             </button>
+            <button 
+              className="btn-secondary" 
+              onClick={() => startOAuth(found.platform)}
+              disabled={verifying}
+            >
+              {verifying ? <Loader2 size={16} className="spin" /> : 'Verify identity with ' + platformLabel(found.platform)}
+            </button>
+            {oauthError && <div className="connect-error"><AlertCircle size={15}/><span>{oauthError}</span></div>}
           </div>
         )}
 
@@ -888,40 +947,27 @@ export default function OutpostApp() {
   const [toast, setToast] = useState(null);
   const [isAdmin, setIsAdmin] = useState(false);
 
+  // Replace the useEffect that reads session:
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const saved = await storageGet("session:identity", false);
-      if (cancelled) return;
-      if (saved && saved.username && saved.platform) {
-        setRemembered(saved);
+      // Read from localStorage instead of storageGet
+      const saved = localStorage.getItem('outpost_session');
+      if (saved && !cancelled) {
         try {
-          const profile = saved.platform === "lichess"
-            ? await fetchLichessProfile(saved.username)
-            : await fetchChesscomProfile(saved.username);
-          const variant = profile.variants.find((v) => v.variant === saved.ratingVariant) || pickPrimaryVariant(profile.variants);
-          const user = {
-            id: normalizeId(profile.usernameDisplay),
-            usernameDisplay: profile.usernameDisplay,
-            platform: profile.platform,
-            rating: variant.rating,
-            ratingVariant: variant.variant,
-            verified: true,
-            platformProfileUrl: profile.platform === "lichess" ? `https://lichess.org/@/${profile.usernameDisplay}` : `https://www.chess.com/member/${profile.usernameDisplay.toLowerCase()}`,
-          };
-          if (!cancelled) {
-            setCurrentUser(user);
-            setIsAdmin(user.usernameDisplay.toLowerCase() === "thiscreeper");
-            await storageSet(userKey(user.id), {
-              ...user,
-              lastSeenAt: Date.now(),
-              bannedUntil: null,
-              bannedPermanently: false,
-            }, true);
-          }
-        } catch {
-          // silent
-        }
+          const user = JSON.parse(saved);
+          // Optionally re-validate rating from API (but we trust stored data)
+          setCurrentUser(user);
+          setIsAdmin(user.usernameDisplay.toLowerCase() === "thiscreeper");
+          // Store user profile in Redis (shared) for others to see
+          await storageSet(userKey(user.id), {
+            ...user,
+            lastSeenAt: Date.now(),
+            bannedUntil: null,
+            bannedPermanently: false,
+          }, true);
+        } catch (e) { /* ignore */ }
       }
       if (!cancelled) setInitializing(false);
     })();
@@ -931,7 +977,7 @@ export default function OutpostApp() {
   const handleConnect = useCallback(async (user) => {
     setCurrentUser(user);
     setIsAdmin(user.usernameDisplay.toLowerCase() === "thiscreeper");
-    await storageSet("session:identity", { username: user.usernameDisplay, platform: user.platform, ratingVariant: user.ratingVariant }, false);
+    localStorage.setItem('outpost_session', JSON.stringify(user));
     await storageSet(userKey(user.id), {
       ...user,
       lastSeenAt: Date.now(),
@@ -943,6 +989,7 @@ export default function OutpostApp() {
   const handleSwitchAccount = useCallback(() => {
     setCurrentUser(null);
     setIsAdmin(false);
+    localStorage.removeItem('outpost_session');
   }, []);
 
   const showToast = useCallback((msg) => {
