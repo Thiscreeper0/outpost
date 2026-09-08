@@ -6,7 +6,7 @@ export const redis = new Redis({
 })
 
 export default async function handler(req, res) {
-  const { action, key, prefix, shared, value } = req.body ?? req.query ?? {};
+  const { action, key, prefix, shared, value, keys } = req.body ?? req.query ?? {};
   const sharedFlag = shared === 'true' || shared === true;
 
   try {
@@ -29,6 +29,16 @@ export default async function handler(req, res) {
       const keys = await redis.keys(`${namespace}*`);
       const prefixLength = `${sharedFlag}:`.length;
       return res.json(keys.map((k) => k.slice(prefixLength)));
+    }
+
+    // New bulk get
+    if (action === 'bulkGet') {
+      if (!Array.isArray(keys) || keys.length === 0) {
+        return res.status(400).json({ error: 'Missing keys array parameter' });
+      }
+      const fullKeys = keys.map(k => `${sharedFlag}:${k}`);
+      const values = await redis.mget(...fullKeys);
+      return res.json(values);
     }
 
     if (action === 'delete') {

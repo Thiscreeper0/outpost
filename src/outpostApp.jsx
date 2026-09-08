@@ -2,8 +2,9 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   Trophy, Medal, Plus, Check, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight,
   ThumbsUp, Send, LogOut, Loader2, AlertCircle, Lock, Search, Swords,
-  Info, CheckCircle2, Pencil, ArrowLeft, Sparkles
+  Info, CheckCircle2, Pencil, ArrowLeft, Sparkles, Flag, Ban, Shield, ExternalLink, FolderOpen, ChevronDown, List, BookOpen, PlusCircle, X, Clock
 } from "lucide-react";
+
 /* ============================================================================
    CONSTANTS
 ============================================================================ */
@@ -41,8 +42,7 @@ function secondTier(score) {
 }
 
 /* ============================================================================
-   CHESS ENGINE — board model + SAN replay (verified against castling, en
-   passant, promotion, disambiguation, comments/variations, custom FEN starts)
+   CHESS ENGINE — board model + SAN replay
 ============================================================================ */
 
 function initialBoard() {
@@ -236,7 +236,7 @@ function replayPGN(pgn) {
 }
 
 /* ============================================================================
-   STORAGE HELPERS  (shared = visible to everyone who opens this artifact)
+   STORAGE HELPERS (optimized with bulkGet)
 ============================================================================ */
 
 async function callStorage(body) {
@@ -261,17 +261,25 @@ async function storageList(prefix, shared) {
 async function storageDelete(key, shared) {
   return callStorage({ action: 'delete', key, shared });
 }
+async function storageBulkGet(keys, shared) {
+  if (!Array.isArray(keys) || keys.length === 0) return [];
+  return callStorage({ action: 'bulkGet', keys, shared });
+}
 
 const gameKey = (id) => `games:${id}`;
 const reviewKey = (gameId, uid) => `reviews:${gameId}:${uid}`;
 const reviewPrefix = (gameId) => `reviews:${gameId}:`;
 const userKey = (uid) => `users:${uid}`;
+const reportKey = (id) => `reports:${id}`;
 
 function normalizeId(username) {
   return username.trim().toLowerCase().replace(/\s+/g, "");
 }
 function newGameId() {
   return `g${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+function newReportId() {
+  return `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
 
 /* ============================================================================
@@ -288,7 +296,6 @@ async function fetchLichessProfile(username) {
     .filter((v) => perfs[v] && perfs[v].games > 0 && !perfs[v].prov)
     .map((v) => ({ variant: v, rating: perfs[v].rating, games: perfs[v].games }));
   if (variants.length === 0) {
-    // fall back to provisional ratings if nothing established yet
     for (const v of order) {
       if (perfs[v] && typeof perfs[v].rating === "number") {
         variants.push({ variant: v, rating: perfs[v].rating, games: perfs[v].games || 0 });
@@ -321,20 +328,66 @@ async function fetchChesscomProfile(username) {
       const prof = await profRes.json();
       usernameDisplay = prof.username || username;
     }
-  } catch { /* cosmetic only */ }
+  } catch {}
   return { platform: "chesscom", usernameDisplay, variants };
 }
 
-async function fetchLichessGamePGN(input) {
-  const trimmed = input.trim();
-  const match = trimmed.match(/([a-zA-Z0-9]{8})(?:[a-zA-Z0-9]{4})?(?:$|[/?#])/) || trimmed.match(/^([a-zA-Z0-9]{8,12})$/);
-  const id = match ? match[1] : null;
-  if (!id) throw new Error("Couldn't find a game ID in that link.");
-  const res = await fetch(`https://lichess.org/game/export/${id}`, { headers: { Accept: "application/x-chess-pgn" } });
-  if (!res.ok) throw new Error("Couldn't fetch that game from Lichess.");
-  const text = await res.text();
-  if (!text || !text.includes("1.")) throw new Error("Lichess didn't return a readable PGN for that link.");
-  return text;
+async function fetchRecentGames(platform, username, variant, maxGames = 10) {
+  if (platform === "lichess") {
+    const url = `https://lichess.org/api/games/user/${encodeURIComponent(username)}?max=${maxGames}&perfType=${variant}&moves=false&opening=false&clocks=false&evals=false&comments=false&tags=false&sort=dateDesc`;
+    const res = await fetch(url, { headers: { Accept: "application/x-ndjson" } });
+    if (!res.ok) throw new Error("Failed to fetch recent games from Lichess.");
+    const text = await res.text();
+    const games = text.trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+    return games.map(g => ({
+      id: g.id,
+      pgn: null,
+      white: g.players.white.user?.name || g.players.white.name || "?",
+      black: g.players.black.user?.name || g.players.black.name || "?",
+      result: g.winner ? (g.winner === "white" ? "1-0" : "0-1") : "½-½",
+      date: new Date(g.createdAt).toLocaleDateString(),
+    }));
+  } else if (platform === "chesscom") {
+    const uname = username.toLowerCase();
+    const archivesRes = await fetch(`https://api.chess.com/pub/player/${uname}/games/archives`);
+    if (!archivesRes.ok) throw new Error("Failed to fetch Chess.com archives.");
+    const archives = await archivesRes.json();
+    const archiveUrls = archives.archives || [];
+    let collected = [];
+    for (let i = archiveUrls.length - 1; i >= 0 && collected.length < maxGames; i--) {
+      const res = await fetch(archiveUrls[i]);
+      if (!res.ok) continue;
+      const data = await res.json();
+      const games = data.games || [];
+      const variantMap = { bullet: "bullet", blitz: "blitz", rapid: "rapid", classical: "classical", daily: "daily" };
+      const filtered = games.filter(g => g.time_class === variantMap[variant]);
+      for (const g of filtered) {
+        if (collected.length >= maxGames) break;
+        collected.push({
+          id: g.url,
+          pgn: g.pgn,
+          white: g.white.username,
+          black: g.black.username,
+          result: g.result,
+          date: new Date(g.end_time * 1000).toLocaleDateString(),
+        });
+      }
+    }
+    return collected;
+  }
+  throw new Error("Unsupported platform for recent games.");
+}
+
+async function fetchGamePGN(platform, gameIdOrUrl, existingPgn) {
+  if (existingPgn) return existingPgn;
+  if (platform === "lichess") {
+    const res = await fetch(`https://lichess.org/game/export/${gameIdOrUrl}`, { headers: { Accept: "application/x-chess-pgn" } });
+    if (!res.ok) throw new Error("Couldn't fetch game PGN from Lichess.");
+    return await res.text();
+  } else if (platform === "chesscom") {
+    throw new Error("PGN not available directly; please paste it manually.");
+  }
+  throw new Error("Unsupported platform.");
 }
 
 function pickPrimaryVariant(variants) {
@@ -395,13 +448,8 @@ function ChessBoard({ board, lastMove, flipped }) {
               const isLast = lastMove && (lastMove.from === sq || lastMove.to === sq);
               const glyph = piece ? (piece[0] === "w" ? WHITE_GLYPH[piece[1]] : BLACK_GLYPH[piece[1]]) : null;
               return (
-                <div
-                  key={ci}
-                  className={"board-sq" + (isLight ? " light" : " dark") + (isLast ? " last-move" : "")}
-                >
-                  {piece && (
-                    <span className={"piece " + (piece[0] === "w" ? "piece-w" : "piece-b")}>{glyph}</span>
-                  )}
+                <div key={ci} className={"board-sq" + (isLight ? " light" : " dark") + (isLast ? " last-move" : "")}>
+                  {piece && <span className={"piece " + (piece[0] === "w" ? "piece-w" : "piece-b")}>{glyph}</span>}
                   {ci === 0 && <span className="coord coord-rank">{8 - realR}</span>}
                   {realR === 7 && <span className="coord coord-file">{String.fromCharCode(97 + realC)}</span>}
                 </div>
@@ -417,36 +465,36 @@ function ChessBoard({ board, lastMove, flipped }) {
 function MoveNav({ ply, maxPly, onChange }) {
   return (
     <div className="move-nav">
-      <button className="icon-btn" onClick={() => onChange(0)} disabled={ply === 0} aria-label="Start">
-        <ChevronsLeft size={16} />
-      </button>
-      <button className="icon-btn" onClick={() => onChange(Math.max(0, ply - 1))} disabled={ply === 0} aria-label="Previous">
-        <ChevronLeft size={16} />
-      </button>
+      <button className="icon-btn" onClick={() => onChange(0)} disabled={ply === 0} aria-label="Start"><ChevronsLeft size={16} /></button>
+      <button className="icon-btn" onClick={() => onChange(Math.max(0, ply - 1))} disabled={ply === 0} aria-label="Previous"><ChevronLeft size={16} /></button>
       <span className="move-nav-count">{ply} / {maxPly}</span>
-      <button className="icon-btn" onClick={() => onChange(Math.min(maxPly, ply + 1))} disabled={ply === maxPly} aria-label="Next">
-        <ChevronRight size={16} />
-      </button>
-      <button className="icon-btn" onClick={() => onChange(maxPly)} disabled={ply === maxPly} aria-label="End">
-        <ChevronsRight size={16} />
-      </button>
+      <button className="icon-btn" onClick={() => onChange(Math.min(maxPly, ply + 1))} disabled={ply === maxPly} aria-label="Next"><ChevronRight size={16} /></button>
+      <button className="icon-btn" onClick={() => onChange(maxPly)} disabled={ply === maxPly} aria-label="End"><ChevronsRight size={16} /></button>
     </div>
   );
 }
 
-function MoveList({ moves, ply, onJump }) {
+function MoveList({ moves, ply, onJump, annotations = [] }) {
   const pairs = [];
   for (let i = 0; i < moves.length; i += 2) {
     pairs.push({ num: moves[i].moveNumber, w: moves[i], b: moves[i + 1] || null, wi: i + 1, bi: i + 2 });
   }
+  const annByPly = {};
+  annotations.forEach(a => { annByPly[a.movePly] = a; });
   return (
     <div className="move-list">
       {pairs.map((p) => (
         <div className="move-list-row" key={p.num}>
           <span className="move-list-num">{p.num}.</span>
-          <button className={"move-list-san" + (ply === p.wi ? " active" : "")} onClick={() => onJump(p.wi)}>{p.w.san}</button>
+          <button className={"move-list-san" + (ply === p.wi ? " active" : "")} onClick={() => onJump(p.wi)}>
+            {p.w.san}
+            {annByPly[p.wi] && <span className="ann-dot" title={annByPly[p.wi].type === 'comment' ? 'Comment' : 'Variation'} />}
+          </button>
           {p.b && (
-            <button className={"move-list-san" + (ply === p.bi ? " active" : "")} onClick={() => onJump(p.bi)}>{p.b.san}</button>
+            <button className={"move-list-san" + (ply === p.bi ? " active" : "")} onClick={() => onJump(p.bi)}>
+              {p.b.san}
+              {annByPly[p.bi] && <span className="ann-dot" title={annByPly[p.bi].type === 'comment' ? 'Comment' : 'Variation'} />}
+            </button>
           )}
         </div>
       ))}
@@ -470,7 +518,7 @@ function GapNotice({ icon, children }) {
 function ConnectScreen({ onConnect, remembered }) {
   const [platform, setPlatform] = useState(remembered?.platform || "lichess");
   const [username, setUsername] = useState(remembered?.username || "");
-  const [status, setStatus] = useState("idle"); // idle | checking | found | manual | error
+  const [status, setStatus] = useState("idle");
   const [error, setError] = useState("");
   const [found, setFound] = useState(null);
   const [chosenVariant, setChosenVariant] = useState(null);
@@ -502,6 +550,7 @@ function ConnectScreen({ onConnect, remembered }) {
       rating: chosenVariant.rating,
       ratingVariant: chosenVariant.variant,
       verified: true,
+      platformProfileUrl: found.platform === "lichess" ? `https://lichess.org/@/${found.usernameDisplay}` : `https://www.chess.com/member/${found.usernameDisplay.toLowerCase()}`,
     });
   };
 
@@ -516,16 +565,14 @@ function ConnectScreen({ onConnect, remembered }) {
       rating: r,
       ratingVariant: manualLabel,
       verified: false,
+      platformProfileUrl: platform === "lichess" ? `https://lichess.org/@/${username.trim()}` : `https://www.chess.com/member/${username.trim().toLowerCase()}`,
     });
   };
 
   return (
     <div className="connect-wrap">
       <div className="connect-card">
-        <div className="brand">
-          <Swords size={22} />
-          <span>Outpost</span>
-        </div>
+        <div className="brand"><Swords size={22} /><span>Outpost</span></div>
         <h1>Get your games looked at by someone stronger.<br />Then do the same for someone behind you.</h1>
         <p className="connect-sub">
           Outpost pairs you with a review partner 300 rating points ahead, and lets you
@@ -564,9 +611,7 @@ function ConnectScreen({ onConnect, remembered }) {
 
         {status === "found" && found && (
           <div className="connect-found">
-            <div className="connect-found-name">
-              Found <strong>{found.usernameDisplay}</strong> on {platformLabel(found.platform)}
-            </div>
+            <div className="connect-found-name">Found <strong>{found.usernameDisplay}</strong> on {platformLabel(found.platform)}</div>
             <div className="variant-chips">
               {found.variants.map((v) => (
                 <button
@@ -625,6 +670,7 @@ function ConnectScreen({ onConnect, remembered }) {
 
 function GameRow({ game, reviewCount, onOpen, already, eligible, reasonLocked }) {
   const tier = ratingTier(game.posterRating);
+  const actualCount = reviewCount ?? game.reviewCount ?? 0;
   return (
     <button className="game-row" onClick={() => onOpen(game.id)}>
       <span className="game-row-rating" style={{ color: tier.color }}>{game.posterRating}</span>
@@ -638,14 +684,14 @@ function GameRow({ game, reviewCount, onOpen, already, eligible, reasonLocked })
         <span className="game-row-question">{game.question || "No question added — general feedback wanted."}</span>
       </span>
       <span className="game-row-meta">
-        <span className={"badge-count" + (reviewCount >= MAX_REVIEWS ? " full" : "")}>{reviewCount}/{MAX_REVIEWS}</span>
+        <span className={"badge-count" + (actualCount >= MAX_REVIEWS ? " full" : "")}>{actualCount}/{MAX_REVIEWS}</span>
         <span className="game-row-time">{timeAgo(game.createdAt)}</span>
       </span>
     </button>
   );
 }
 
-function ReviewCard({ review, isOwn, isPoster, gameOpen, isResolvingReview, onUpvote, onEdit, onResolve, voted }) {
+function ReviewCard({ review, isOwn, isPoster, gameOpen, isResolvingReview, onUpvote, onEdit, onResolve, voted, onReport, currentUser, banStatus }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(review.text);
   const tier = ratingTier(review.reviewerRating);
@@ -656,6 +702,8 @@ function ReviewCard({ review, isOwn, isPoster, gameOpen, isResolvingReview, onUp
     setEditing(false);
   };
 
+  const hasAnnotations = review.annotations && review.annotations.length > 0;
+
   return (
     <div className={"review-card" + (isResolvingReview ? " resolved" : "")}>
       <div className="review-head">
@@ -665,19 +713,18 @@ function ReviewCard({ review, isOwn, isPoster, gameOpen, isResolvingReview, onUp
         </span>
         <RatingBadge rating={review.reviewerRating} variant={review.reviewerRatingVariant} />
         <span className="review-time">{timeAgo(review.updatedAt || review.createdAt)}{review.updatedAt && review.updatedAt !== review.createdAt ? " · edited" : ""}</span>
+        {!isOwn && currentUser && (
+          <button className="report-btn" onClick={onReport} title="Report this review"><Flag size={12} /></button>
+        )}
       </div>
 
-      {isResolvingReview && (
-        <div className="resolved-flag"><CheckCircle2 size={14} /> Marked as the answer by the poster</div>
-      )}
+      {isResolvingReview && <div className="resolved-flag"><CheckCircle2 size={14} /> Marked as the answer by the poster</div>}
 
       {editing ? (
         <div className="review-edit">
           <textarea value={draft} onChange={(e) => setDraft(e.target.value)} rows={4} />
           <div className="review-edit-row">
-            <span className={"char-count" + (draft.trim().length < MIN_REVIEW_CHARS ? " short" : "")}>
-              {draft.trim().length}/{MIN_REVIEW_CHARS}+ characters
-            </span>
+            <span className={"char-count" + (draft.trim().length < MIN_REVIEW_CHARS ? " short" : "")}>{draft.trim().length}/{MIN_REVIEW_CHARS}+ characters</span>
             <div>
               <button className="link-btn" onClick={() => { setDraft(review.text); setEditing(false); }}>Cancel</button>
               <button className="btn-primary btn-sm" onClick={save} disabled={draft.trim().length < MIN_REVIEW_CHARS}>Save</button>
@@ -685,7 +732,29 @@ function ReviewCard({ review, isOwn, isPoster, gameOpen, isResolvingReview, onUp
           </div>
         </div>
       ) : (
-        <p className="review-text">{review.text}</p>
+        <>
+          <p className="review-text">{review.text}</p>
+          {hasAnnotations && (
+            <div className="review-annotations">
+              <span className="ann-label"><BookOpen size={12} /> Annotations</span>
+              <ul>
+                {review.annotations.map((a, i) => (
+                  <li key={i}>
+                    <span className="ann-ply">Move {a.movePly}:</span>
+                    {a.type === 'comment' ? (
+                      <span className="ann-comment">{a.text}</span>
+                    ) : (
+                      <span className="ann-variation">
+                        <span className="ann-variation-moves">{a.moves?.join(' ')}</span>
+                        {a.text && <span className="ann-comment"> — {a.text}</span>}
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </>
       )}
 
       <div className="review-actions">
@@ -704,6 +773,110 @@ function ReviewCard({ review, isOwn, isPoster, gameOpen, isResolvingReview, onUp
 }
 
 /* ============================================================================
+   STUDY-COMPONENT FOR REVIEWING (add variations/comments)
+============================================================================ */
+
+function ReviewEditor({ parsed, initialPly, onSave }) {
+  const [ply, setPly] = useState(initialPly);
+  const [annotations, setAnnotations] = useState([]);
+  const [commentInput, setCommentInput] = useState("");
+  const [variationMoves, setVariationMoves] = useState([]);
+  const [variationInput, setVariationInput] = useState("");
+  const [showVariationInput, setShowVariationInput] = useState(false);
+
+  const maxPly = parsed.positions.length - 1;
+
+  const addComment = () => {
+    if (!commentInput.trim()) return;
+    const exists = annotations.find(a => a.movePly === ply && a.type === 'comment');
+    if (exists) {
+      setAnnotations(annotations.map(a => a.movePly === ply && a.type === 'comment' ? { ...a, text: commentInput.trim() } : a));
+    } else {
+      setAnnotations([...annotations, { movePly: ply, type: 'comment', text: commentInput.trim() }]);
+    }
+    setCommentInput("");
+  };
+
+  const addVariation = () => {
+    if (variationMoves.length === 0) return;
+    const exists = annotations.find(a => a.movePly === ply && a.type === 'variation');
+    if (exists) {
+      setAnnotations(annotations.map(a => a.movePly === ply && a.type === 'variation' ? { ...a, moves: variationMoves, text: commentInput.trim() } : a));
+    } else {
+      setAnnotations([...annotations, { movePly: ply, type: 'variation', moves: variationMoves, text: commentInput.trim() }]);
+    }
+    setVariationMoves([]);
+    setVariationInput("");
+    setShowVariationInput(false);
+    setCommentInput("");
+  };
+
+  const handleVariationMoveAdd = () => {
+    if (!variationInput.trim()) return;
+    try {
+      const board = cloneBoard(parsed.positions[ply]);
+      const turn = (ply % 2 === 0) ? 'w' : 'b';
+      applySAN(board, turn, variationInput.trim());
+      setVariationMoves([...variationMoves, variationInput.trim()]);
+      setVariationInput("");
+    } catch {
+      alert("Invalid move SAN.");
+    }
+  };
+
+  return (
+    <div className="review-editor">
+      <div className="board-container">
+        <ChessBoard board={parsed.positions[ply]} lastMove={ply > 0 ? parsed.moves[ply - 1] : null} />
+        <MoveNav ply={ply} maxPly={maxPly} onChange={setPly} />
+        <MoveList moves={parsed.moves} ply={ply} onJump={setPly} annotations={annotations} />
+      </div>
+      <div className="annotation-panel">
+        <h4>Add annotation at move {ply}</h4>
+        <div className="annotation-actions">
+          <textarea value={commentInput} onChange={(e) => setCommentInput(e.target.value)} placeholder="Comment for this position..." rows={2} />
+          <button className="btn-secondary" onClick={addComment} disabled={!commentInput.trim()}>
+            <PlusCircle size={14} /> Add comment
+          </button>
+          <button className="btn-secondary" onClick={() => setShowVariationInput(!showVariationInput)}>
+            <ChevronDown size={14} /> Variation
+          </button>
+          {showVariationInput && (
+            <div className="variation-input-area">
+              <input
+                type="text"
+                value={variationInput}
+                onChange={(e) => setVariationInput(e.target.value)}
+                placeholder="Enter SAN move (e.g., Nf3)"
+                onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleVariationMoveAdd(); } }}
+              />
+              <button className="btn-secondary" onClick={handleVariationMoveAdd}>Add move</button>
+              <button className="btn-primary btn-sm" onClick={addVariation} disabled={variationMoves.length === 0}>Save variation</button>
+              {variationMoves.length > 0 && (
+                <div className="variation-preview"><strong>Variation:</strong> {variationMoves.join(' ')}</div>
+              )}
+            </div>
+          )}
+        </div>
+        {annotations.length > 0 && (
+          <div className="existing-annotations">
+            <strong>Current annotations:</strong>
+            <ul>
+              {annotations.map((a, i) => (
+                <li key={i}>Move {a.movePly}: {a.type === 'comment' ? a.text : `Variation ${a.moves.join(' ')} ${a.text || ''}`}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        <button className="btn-primary btn-block" onClick={() => onSave(annotations)} disabled={annotations.length === 0}>
+          Save annotations
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================================
    MAIN EXPORT
 ============================================================================ */
 
@@ -713,6 +886,7 @@ export default function OutpostApp() {
   const [remembered, setRemembered] = useState(null);
   const [tab, setTab] = useState("queue");
   const [toast, setToast] = useState(null);
+  const [isAdmin, setIsAdmin] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -726,18 +900,27 @@ export default function OutpostApp() {
             ? await fetchLichessProfile(saved.username)
             : await fetchChesscomProfile(saved.username);
           const variant = profile.variants.find((v) => v.variant === saved.ratingVariant) || pickPrimaryVariant(profile.variants);
+          const user = {
+            id: normalizeId(profile.usernameDisplay),
+            usernameDisplay: profile.usernameDisplay,
+            platform: profile.platform,
+            rating: variant.rating,
+            ratingVariant: variant.variant,
+            verified: true,
+            platformProfileUrl: profile.platform === "lichess" ? `https://lichess.org/@/${profile.usernameDisplay}` : `https://www.chess.com/member/${profile.usernameDisplay.toLowerCase()}`,
+          };
           if (!cancelled) {
-            setCurrentUser({
-              id: normalizeId(profile.usernameDisplay),
-              usernameDisplay: profile.usernameDisplay,
-              platform: profile.platform,
-              rating: variant.rating,
-              ratingVariant: variant.variant,
-              verified: true,
-            });
+            setCurrentUser(user);
+            setIsAdmin(user.usernameDisplay.toLowerCase() === "thiscreeper");
+            await storageSet(userKey(user.id), {
+              ...user,
+              lastSeenAt: Date.now(),
+              bannedUntil: null,
+              bannedPermanently: false,
+            }, true);
           }
         } catch {
-          // silent — user can reconnect manually
+          // silent
         }
       }
       if (!cancelled) setInitializing(false);
@@ -747,15 +930,19 @@ export default function OutpostApp() {
 
   const handleConnect = useCallback(async (user) => {
     setCurrentUser(user);
+    setIsAdmin(user.usernameDisplay.toLowerCase() === "thiscreeper");
     await storageSet("session:identity", { username: user.usernameDisplay, platform: user.platform, ratingVariant: user.ratingVariant }, false);
     await storageSet(userKey(user.id), {
-      id: user.id, usernameDisplay: user.usernameDisplay, platform: user.platform,
-      rating: user.rating, ratingVariant: user.ratingVariant, verified: user.verified, lastSeenAt: Date.now(),
+      ...user,
+      lastSeenAt: Date.now(),
+      bannedUntil: null,
+      bannedPermanently: false,
     }, true);
   }, []);
 
   const handleSwitchAccount = useCallback(() => {
     setCurrentUser(null);
+    setIsAdmin(false);
   }, []);
 
   const showToast = useCallback((msg) => {
@@ -765,9 +952,7 @@ export default function OutpostApp() {
 
   if (initializing) {
     return (
-      <div className="boot-screen">
-        <Loader2 size={20} className="spin" />
-      </div>
+      <div className="boot-screen"><Loader2 size={20} className="spin" /></div>
     );
   }
 
@@ -783,7 +968,14 @@ export default function OutpostApp() {
   return (
     <div className="outpost-root">
       <GlobalStyle />
-      <AppShell currentUser={currentUser} onSwitchAccount={handleSwitchAccount} tab={tab} setTab={setTab} showToast={showToast} />
+      <AppShell
+        currentUser={currentUser}
+        onSwitchAccount={handleSwitchAccount}
+        tab={tab}
+        setTab={setTab}
+        showToast={showToast}
+        isAdmin={isAdmin}
+      />
       {toast && <div className="toast">{toast}</div>}
     </div>
   );
@@ -793,46 +985,57 @@ export default function OutpostApp() {
    APP SHELL
 ============================================================================ */
 
-function AppShell({ currentUser, onSwitchAccount, tab, setTab, showToast }) {
+function AppShell({ currentUser, onSwitchAccount, tab, setTab, showToast, isAdmin }) {
   const [activeGameId, setActiveGameId] = useState(null);
+  const [viewingProfileId, setViewingProfileId] = useState(null);
 
   const openGame = (id) => setActiveGameId(id);
   const closeGame = () => setActiveGameId(null);
+  const openProfile = (id) => setViewingProfileId(id);
+  const closeProfile = () => setViewingProfileId(null);
 
   return (
     <div className="shell">
       <header className="shell-header">
-        <div className="brand">
-          <Swords size={18} />
-          <span>Outpost</span>
-        </div>
+        <div className="brand"><Swords size={18} /><span>Outpost</span></div>
         <div className="identity">
           <span className="identity-name">{currentUser.usernameDisplay}</span>
           <PlatformTag platform={currentUser.platform} />
           <RatingBadge rating={currentUser.rating} variant={currentUser.ratingVariant} />
           {!currentUser.verified && <span className="badge-mini self-reported">self-reported</span>}
+          {isAdmin && <span className="badge-mini admin"><Shield size={10} /> Admin</span>}
           <button className="icon-btn" onClick={onSwitchAccount} title="Switch account"><LogOut size={15} /></button>
         </div>
       </header>
 
-      {!activeGameId && (
+      {!activeGameId && !viewingProfileId && (
         <nav className="tabs">
           <button className={tab === "queue" ? "active" : ""} onClick={() => setTab("queue")}>Review queue</button>
           <button className={tab === "mygames" ? "active" : ""} onClick={() => setTab("mygames")}>My games</button>
           <button className={tab === "submit" ? "active" : ""} onClick={() => setTab("submit")}>Submit a game</button>
+          <button className={tab === "players" ? "active" : ""} onClick={() => setTab("players")}>Players</button>
           <button className={tab === "leaderboard" ? "active" : ""} onClick={() => setTab("leaderboard")}>Leaderboard</button>
+          {isAdmin && <button className={tab === "admin" ? "active" : ""} onClick={() => setTab("admin")}>Admin</button>}
         </nav>
       )}
 
       <main className="content">
         {activeGameId ? (
           <GameDetail gameId={activeGameId} currentUser={currentUser} onBack={closeGame} showToast={showToast} />
+        ) : viewingProfileId ? (
+          <ProfileView userId={viewingProfileId} currentUser={currentUser} onBack={closeProfile} onOpenGame={openGame} />
         ) : tab === "queue" ? (
           <QueueView currentUser={currentUser} onOpen={openGame} />
         ) : tab === "mygames" ? (
           <MyGamesView currentUser={currentUser} onOpen={openGame} />
         ) : tab === "submit" ? (
           <SubmitView currentUser={currentUser} onSubmitted={(id) => { setTab("mygames"); showToast("Game posted for review."); }} />
+        ) : tab === "players" ? (
+          <PlayersView currentUser={currentUser} onOpenProfile={openProfile} />
+        ) : tab === "leaderboard" ? (
+          <LeaderboardView />
+        ) : tab === "admin" && isAdmin ? (
+          <AdminView currentUser={currentUser} showToast={showToast} />
         ) : (
           <LeaderboardView />
         )}
@@ -842,7 +1045,7 @@ function AppShell({ currentUser, onSwitchAccount, tab, setTab, showToast }) {
 }
 
 /* ============================================================================
-   QUEUE VIEW
+   QUEUE VIEW (optimized with bulkGet and stored reviewCount)
 ============================================================================ */
 
 function QueueView({ currentUser, onOpen }) {
@@ -855,19 +1058,22 @@ function QueueView({ currentUser, onOpen }) {
     setError("");
     try {
       const keys = await storageList("games:", true);
-      const games = (await Promise.all(keys.map((k) => storageGet(k, true)))).filter(Boolean);
+      const games = (await storageBulkGet(keys, true)).filter(Boolean);
       const eligible = games.filter(
         (g) => g.status === "open" && g.posterId !== currentUser.id && currentUser.rating - g.posterRating >= REVIEW_GAP
       );
       eligible.sort((a, b) => b.createdAt - a.createdAt);
-      const withCounts = await Promise.all(
-        eligible.map(async (g) => {
-          const rkeys = await storageList(reviewPrefix(g.id), true);
-          const already = rkeys.includes(reviewKey(g.id, currentUser.id));
-          return { game: g, reviewCount: rkeys.length, already };
-        })
-      );
-      setRows(withCounts.filter((r) => r.reviewCount < MAX_REVIEWS || r.already));
+
+      // Check which of these eligible games the user has already reviewed
+      const reviewKeysForUser = eligible.map(g => reviewKey(g.id, currentUser.id));
+      const existingReviews = await storageBulkGet(reviewKeysForUser, true);
+      const withAlready = eligible.map((g, i) => ({
+        game: g,
+        reviewCount: g.reviewCount || 0,
+        already: !!existingReviews[i],
+      }));
+
+      setRows(withAlready.filter((r) => r.reviewCount < MAX_REVIEWS || r.already));
     } catch (e) {
       setError("Couldn't load the queue right now.");
     } finally {
@@ -907,7 +1113,7 @@ function QueueView({ currentUser, onOpen }) {
 }
 
 /* ============================================================================
-   MY GAMES VIEW
+   MY GAMES VIEW (uses stored reviewCount)
 ============================================================================ */
 
 function MyGamesView({ currentUser, onOpen }) {
@@ -918,16 +1124,10 @@ function MyGamesView({ currentUser, onOpen }) {
     setLoading(true);
     try {
       const keys = await storageList("games:", true);
-      const games = (await Promise.all(keys.map((k) => storageGet(k, true)))).filter(Boolean);
+      const games = (await storageBulkGet(keys, true)).filter(Boolean);
       const mine = games.filter((g) => g.posterId === currentUser.id);
       mine.sort((a, b) => b.createdAt - a.createdAt);
-      const withCounts = await Promise.all(
-        mine.map(async (g) => {
-          const rkeys = await storageList(reviewPrefix(g.id), true);
-          return { game: g, reviewCount: rkeys.length };
-        })
-      );
-      setRows(withCounts);
+      setRows(mine.map(g => ({ game: g, reviewCount: g.reviewCount || 0 })));
     } finally {
       setLoading(false);
     }
@@ -954,48 +1154,59 @@ function MyGamesView({ currentUser, onOpen }) {
 }
 
 /* ============================================================================
-   SUBMIT VIEW
+   SUBMIT VIEW — recent games import, no manual PGN by default
 ============================================================================ */
 
 function SubmitView({ currentUser, onSubmitted }) {
-  const [pgn, setPgn] = useState("");
-  const [question, setQuestion] = useState("");
-  const [importUrl, setImportUrl] = useState("");
-  const [importing, setImporting] = useState(false);
+  const [selectedGame, setSelectedGame] = useState(null);
+  const [variant, setVariant] = useState("blitz");
+  const [recentGames, setRecentGames] = useState([]);
+  const [loadingGames, setLoadingGames] = useState(false);
   const [importError, setImportError] = useState("");
+  const [question, setQuestion] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState("");
 
-  const preview = useMemo(() => {
-    if (!pgn.trim()) return null;
-    try { return replayPGN(pgn); } catch { return null; }
-  }, [pgn]);
-  const [ply, setPly] = useState(0);
-  useEffect(() => { if (preview) setPly(preview.positions.length - 1); }, [preview?.moves?.length]);
-
-  const doImport = async () => {
-    if (!importUrl.trim()) return;
-    setImporting(true);
+  const fetchGames = async () => {
+    setLoadingGames(true);
     setImportError("");
+    setSelectedGame(null);
     try {
-      const text = await fetchLichessGamePGN(importUrl);
-      setPgn(text);
+      const games = await fetchRecentGames(currentUser.platform, currentUser.usernameDisplay, variant, 10);
+      setRecentGames(games);
     } catch (e) {
-      setImportError(e.message || "Import failed.");
+      setImportError(e.message || "Couldn't load recent games.");
     } finally {
-      setImporting(false);
+      setLoadingGames(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchGames();
+  }, [variant]);
+
+  const selectGame = async (game) => {
+    setSelectedGame(game);
+    if (!game.pgn) {
+      try {
+        const pgn = await fetchGamePGN(currentUser.platform, game.id, null);
+        setSelectedGame({ ...game, pgn });
+      } catch (e) {
+        setImportError("Couldn't load PGN for that game. You may paste it below.");
+      }
     }
   };
 
   const submit = async () => {
-    if (!pgn.trim()) { setSubmitError("Paste a PGN first."); return; }
+    if (!selectedGame) { setSubmitError("Select a game first."); return; }
+    if (!selectedGame.pgn) { setSubmitError("PGN missing for selected game."); return; }
     setSubmitting(true);
     setSubmitError("");
     try {
       const id = newGameId();
       await storageSet(gameKey(id), {
         id,
-        pgn: pgn.trim(),
+        pgn: selectedGame.pgn.trim(),
         question: question.trim(),
         posterId: currentUser.id,
         posterUsernameDisplay: currentUser.usernameDisplay,
@@ -1006,8 +1217,34 @@ function SubmitView({ currentUser, onSubmitted }) {
         createdAt: Date.now(),
         resolvedReviewerId: null,
         resolvedAt: null,
+        reviewCount: 0,
+        sourceGameId: selectedGame.id,
+        sourcePlatform: currentUser.platform,
       }, true);
-      setPgn(""); setQuestion(""); setImportUrl("");
+
+      // Update user's gameCount
+      const user = await storageGet(userKey(currentUser.id), true);
+      if (user) {
+        await storageSet(userKey(currentUser.id), { ...user, gameCount: (user.gameCount || 0) + 1, lastSeenAt: Date.now() }, true);
+      } else {
+        await storageSet(userKey(currentUser.id), {
+          id: currentUser.id,
+          usernameDisplay: currentUser.usernameDisplay,
+          platform: currentUser.platform,
+          rating: currentUser.rating,
+          ratingVariant: currentUser.ratingVariant,
+          verified: currentUser.verified,
+          platformProfileUrl: currentUser.platformProfileUrl,
+          lastSeenAt: Date.now(),
+          gameCount: 1,
+          reviewCount: 0,
+          bannedUntil: null,
+          bannedPermanently: false,
+        }, true);
+      }
+
+      setSelectedGame(null);
+      setQuestion("");
       onSubmitted(id);
     } catch (e) {
       setSubmitError("Couldn't post that game — try again.");
@@ -1018,55 +1255,67 @@ function SubmitView({ currentUser, onSubmitted }) {
 
   return (
     <div className="view">
-      <ViewHeader title="Submit a game" subtitle="Paste a PGN, say what you're unsure about, and a stronger player will take a look." />
+      <ViewHeader title="Submit a game" subtitle="Choose one of your recent games and ask for feedback. Your opponent's name will be visible, so be respectful." />
 
       <div className="submit-grid">
         <div className="submit-col">
-          <label className="field-label">Import from a Lichess game link (optional)</label>
-          <div className="connect-form-row">
-            <input type="text" value={importUrl} onChange={(e) => setImportUrl(e.target.value)} placeholder="https://lichess.org/abcd1234" />
-            <button className="btn-secondary" onClick={doImport} disabled={importing}>
-              {importing ? <Loader2 size={15} className="spin" /> : "Import"}
-            </button>
-          </div>
+          <label className="field-label">Select variant</label>
+          <select value={variant} onChange={(e) => setVariant(e.target.value)} className="full-width">
+            <option value="blitz">Blitz</option>
+            <option value="bullet">Bullet</option>
+            <option value="rapid">Rapid</option>
+            <option value="classical">Classical</option>
+          </select>
+          <button className="btn-secondary" onClick={fetchGames} disabled={loadingGames}>
+            {loadingGames ? <Loader2 size={15} className="spin" /> : "Refresh games"}
+          </button>
           {importError && <div className="connect-error"><AlertCircle size={14} /><span>{importError}</span></div>}
 
-          <label className="field-label">PGN</label>
-          <textarea
-            className="pgn-input"
-            value={pgn}
-            onChange={(e) => setPgn(e.target.value)}
-            rows={10}
-            placeholder={`1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 ...`}
-          />
+          <label className="field-label">Recent {variant} games</label>
+          {loadingGames ? (
+            <div className="loading-rows"><Loader2 size={18} className="spin" /></div>
+          ) : recentGames.length === 0 ? (
+            <EmptyState icon={<Swords size={16} />} title="No recent games" body="You haven't played any games in this variant recently." compact />
+          ) : (
+            <div className="game-picker">
+              {recentGames.map((g) => (
+                <button
+                  key={g.id}
+                  className={"game-picker-item" + (selectedGame?.id === g.id ? " selected" : "")}
+                  onClick={() => selectGame(g)}
+                >
+                  <span className="gpi-players">{g.white} vs {g.black}</span>
+                  <span className="gpi-result">{g.result}</span>
+                  <span className="gpi-date">{g.date}</span>
+                </button>
+              ))}
+            </div>
+          )}
 
-          <label className="field-label">What do you want feedback on?</label>
-          <textarea
-            className="question-input"
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            rows={3}
-            placeholder="e.g. I felt fine out of the opening but lost the thread around move 20 — where did it go wrong?"
-          />
-
-          {submitError && <div className="connect-error"><AlertCircle size={14} /><span>{submitError}</span></div>}
-          <button className="btn-primary btn-block" onClick={submit} disabled={submitting || !pgn.trim()}>
-            {submitting ? <Loader2 size={15} className="spin" /> : "Post for review"}
-          </button>
+          {selectedGame && (
+            <>
+              <label className="field-label">What do you want feedback on?</label>
+              <textarea
+                className="question-input"
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+                rows={3}
+                placeholder="e.g. I felt fine out of the opening but lost the thread around move 20 — where did it go wrong?"
+              />
+              {submitError && <div className="connect-error"><AlertCircle size={14} /><span>{submitError}</span></div>}
+              <button className="btn-primary btn-block" onClick={submit} disabled={submitting || !selectedGame?.pgn}>
+                {submitting ? <Loader2 size={15} className="spin" /> : "Post for review"}
+              </button>
+            </>
+          )}
         </div>
 
         <div className="submit-col preview-col">
           <label className="field-label">Preview</label>
-          {preview && preview.moves.length > 0 ? (
-            <>
-              <ChessBoard board={preview.positions[ply]} lastMove={ply > 0 ? preview.moves[ply - 1] : null} />
-              <MoveNav ply={ply} maxPly={preview.positions.length - 1} onChange={setPly} />
-              {preview.errors.length > 0 && (
-                <p className="parse-warning"><Info size={13} /> Stopped reading after move {preview.moves.length} — the rest may use notation this preview can't parse, but the full PGN is still saved.</p>
-              )}
-            </>
+          {selectedGame?.pgn ? (
+            <GamePreview pgn={selectedGame.pgn} />
           ) : (
-            <EmptyState icon={<Swords size={16} />} title="Board preview" body="Paste a PGN to see it here." compact />
+            <EmptyState icon={<Swords size={16} />} title="Board preview" body="Select a game to see it here." compact />
           )}
         </div>
       </div>
@@ -1074,8 +1323,25 @@ function SubmitView({ currentUser, onSubmitted }) {
   );
 }
 
+function GamePreview({ pgn }) {
+  const parsed = useMemo(() => {
+    try { return replayPGN(pgn); } catch { return null; }
+  }, [pgn]);
+  const [ply, setPly] = useState(parsed ? parsed.positions.length - 1 : 0);
+  useEffect(() => { if (parsed) setPly(parsed.positions.length - 1); }, [parsed]);
+
+  if (!parsed || parsed.moves.length === 0) return <p className="parse-warning">Could not parse PGN.</p>;
+  return (
+    <>
+      <ChessBoard board={parsed.positions[ply]} lastMove={ply > 0 ? parsed.moves[ply - 1] : null} />
+      <MoveNav ply={ply} maxPly={parsed.positions.length - 1} onChange={setPly} />
+      <MoveList moves={parsed.moves} ply={ply} onJump={setPly} />
+    </>
+  );
+}
+
 /* ============================================================================
-   GAME DETAIL
+   GAME DETAIL — with annotations and report
 ============================================================================ */
 
 function GameDetail({ gameId, currentUser, onBack, showToast }) {
@@ -1086,14 +1352,17 @@ function GameDetail({ gameId, currentUser, onBack, showToast }) {
   const [reviewDraft, setReviewDraft] = useState("");
   const [posting, setPosting] = useState(false);
   const [postError, setPostError] = useState("");
+  const [showReviewEditor, setShowReviewEditor] = useState(false);
+  const [savedAnnotations, setSavedAnnotations] = useState([]);
+  const [reporting, setReporting] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     const g = await storageGet(gameKey(gameId), true);
     setGame(g);
     if (g) {
-      const keys = await storageList(reviewPrefix(gameId), true);
-      const list = (await Promise.all(keys.map((k) => storageGet(k, true)))).filter(Boolean);
+      const reviewKeys = await storageList(reviewPrefix(gameId), true);
+      const list = (await storageBulkGet(reviewKeys, true)).filter(Boolean);
       list.sort((a, b) => a.createdAt - b.createdAt);
       setReviews(list);
     }
@@ -1133,11 +1402,25 @@ function GameDetail({ gameId, currentUser, onBack, showToast }) {
         reviewerRating: currentUser.rating,
         reviewerRatingVariant: currentUser.ratingVariant,
         text,
+        annotations: savedAnnotations,
         createdAt: existing ? existing.createdAt : now,
         updatedAt: now,
         upvotedBy: existing ? existing.upvotedBy || [] : [],
       }, true);
+
+      // If new review, increment game.reviewCount
+      if (!existing) {
+        await storageSet(gameKey(gameId), { ...game, reviewCount: (game.reviewCount || 0) + 1 }, true);
+        // Update reviewer's reviewCount
+        const reviewerUser = await storageGet(userKey(currentUser.id), true);
+        if (reviewerUser) {
+          await storageSet(userKey(currentUser.id), { ...reviewerUser, reviewCount: (reviewerUser.reviewCount || 0) + 1, lastSeenAt: Date.now() }, true);
+        }
+      }
+
       setReviewDraft("");
+      setSavedAnnotations([]);
+      setShowReviewEditor(false);
       showToast("Review posted.");
       await load();
     } catch {
@@ -1147,10 +1430,15 @@ function GameDetail({ gameId, currentUser, onBack, showToast }) {
     }
   };
 
-  const editReview = async (reviewerId, newText) => {
+  const editReview = async (reviewerId, newText, newAnnotations) => {
     const r = reviews.find((rv) => rv.reviewerId === reviewerId);
     if (!r) return;
-    await storageSet(reviewKey(gameId, reviewerId), { ...r, text: newText, updatedAt: Date.now() }, true);
+    await storageSet(reviewKey(gameId, reviewerId), {
+      ...r,
+      text: newText || r.text,
+      annotations: newAnnotations || r.annotations,
+      updatedAt: Date.now()
+    }, true);
     showToast("Review updated.");
     load();
   };
@@ -1169,6 +1457,52 @@ function GameDetail({ gameId, currentUser, onBack, showToast }) {
     load();
   };
 
+  const reportReview = async (review) => {
+    setReporting({ type: 'review', id: review.reviewerId });
+    try {
+      const reportId = newReportId();
+      await storageSet(reportKey(reportId), {
+        id: reportId,
+        targetType: 'review',
+        targetId: review.reviewerId,
+        gameId: gameId,
+        reporterId: currentUser.id,
+        reporterUsername: currentUser.usernameDisplay,
+        createdAt: Date.now(),
+        status: 'open',
+        note: '',
+      }, true);
+      showToast("Review reported. An admin will review it.");
+    } catch {
+      showToast("Failed to report review.");
+    } finally {
+      setReporting(null);
+    }
+  };
+
+  const reportGame = async () => {
+    setReporting({ type: 'game', id: gameId });
+    try {
+      const reportId = newReportId();
+      await storageSet(reportKey(reportId), {
+        id: reportId,
+        targetType: 'game',
+        targetId: gameId,
+        gameId: gameId,
+        reporterId: currentUser.id,
+        reporterUsername: currentUser.usernameDisplay,
+        createdAt: Date.now(),
+        status: 'open',
+        note: '',
+      }, true);
+      showToast("Game reported. An admin will review it.");
+    } catch {
+      showToast("Failed to report game.");
+    } finally {
+      setReporting(null);
+    }
+  };
+
   return (
     <div className="view">
       <button className="back-link" onClick={onBack}><ArrowLeft size={14} /> Back</button>
@@ -1179,9 +1513,13 @@ function GameDetail({ gameId, currentUser, onBack, showToast }) {
             <span className="game-row-title">
               {game.posterUsernameDisplay}
               <PlatformTag platform={game.posterPlatform} />
+              <a href={currentUser.platformProfileUrl} target="_blank" rel="noopener noreferrer" className="profile-link"><ExternalLink size={12} /> Profile</a>
             </span>
             <RatingBadge rating={game.posterRating} variant={game.posterRatingVariant} />
             <span className={"status-tag " + game.status}>{game.status === "open" ? "Open" : "Resolved"}</span>
+            {!isPoster && (
+              <button className="report-btn" onClick={reportGame} title="Report this game"><Flag size={12} /></button>
+            )}
           </div>
 
           {parsed && parsed.moves.length > 0 ? (
@@ -1218,8 +1556,10 @@ function GameDetail({ gameId, currentUser, onBack, showToast }) {
                 isResolvingReview={game.resolvedReviewerId === r.reviewerId}
                 voted={(r.upvotedBy || []).includes(currentUser.id)}
                 onUpvote={() => toggleUpvote(r)}
-                onEdit={(text) => editReview(r.reviewerId, text)}
+                onEdit={(text, anns) => editReview(r.reviewerId, text, anns)}
                 onResolve={() => resolveWith(r.reviewerId)}
+                onReport={() => reportReview(r)}
+                currentUser={currentUser}
               />
             ))}
 
@@ -1247,7 +1587,7 @@ function GameDetail({ gameId, currentUser, onBack, showToast }) {
               <p className="parse-warning"><Info size={13} /> You already reviewed this game — edit your review above any time.</p>
             )}
 
-            {canReviewNew && (
+            {canReviewNew && !showReviewEditor && (
               <div className="review-form">
                 <span className="field-label">Your review</span>
                 <textarea
@@ -1261,10 +1601,26 @@ function GameDetail({ gameId, currentUser, onBack, showToast }) {
                     {reviewDraft.trim().length}/{MIN_REVIEW_CHARS}+ characters
                   </span>
                   {postError && <span className="inline-error">{postError}</span>}
-                  <button className="btn-primary btn-sm" onClick={postReview} disabled={posting || reviewDraft.trim().length < MIN_REVIEW_CHARS}>
-                    {posting ? <Loader2 size={14} className="spin" /> : <><Send size={13} /> Post review</>}
-                  </button>
+                  <div className="btn-group">
+                    <button className="btn-secondary" onClick={() => setShowReviewEditor(true)} disabled={reviewDraft.trim().length < MIN_REVIEW_CHARS}>
+                      <BookOpen size={13} /> Add annotations
+                    </button>
+                    <button className="btn-primary btn-sm" onClick={postReview} disabled={posting || reviewDraft.trim().length < MIN_REVIEW_CHARS}>
+                      {posting ? <Loader2 size={14} className="spin" /> : <><Send size={13} /> Post review</>}
+                    </button>
+                  </div>
                 </div>
+              </div>
+            )}
+
+            {canReviewNew && showReviewEditor && (
+              <div className="review-editor-container">
+                <span className="field-label">Add annotations (comments & variations)</span>
+                <ReviewEditor
+                  parsed={parsed}
+                  initialPly={ply}
+                  onSave={(anns) => { setSavedAnnotations(anns); setShowReviewEditor(false); }}
+                />
               </div>
             )}
           </div>
@@ -1275,7 +1631,138 @@ function GameDetail({ gameId, currentUser, onBack, showToast }) {
 }
 
 /* ============================================================================
-   LEADERBOARD
+   PLAYERS VIEW (uses stored user counts)
+============================================================================ */
+
+function PlayersView({ currentUser, onOpenProfile }) {
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const keys = await storageList("users:", true);
+      const userList = (await storageBulkGet(keys, true)).filter(Boolean);
+      if (!cancelled) {
+        setUsers(userList.sort((a,b) => (b.lastSeenAt || 0) - (a.lastSeenAt || 0)));
+        setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  if (loading) return <LoadingRows />;
+
+  return (
+    <div className="view">
+      <ViewHeader title="Players" subtitle="Everyone who has connected to Outpost. Click to see their games and reviews." />
+      <div className="players-grid">
+        {users.map((u) => (
+          <div className="player-card" key={u.id} onClick={() => onOpenProfile(u.id)}>
+            <div className="player-card-header">
+              <span className="player-name">{u.usernameDisplay}</span>
+              <PlatformTag platform={u.platform} />
+              {u.bannedPermanently || (u.bannedUntil && u.bannedUntil > Date.now()) ? (
+                <span className="badge-mini banned"><Ban size={10} /> Banned</span>
+              ) : null}
+            </div>
+            <RatingBadge rating={u.rating} variant={u.ratingVariant} />
+            <div className="player-stats">
+              <span>{u.gameCount || 0} games</span>
+              <span>{u.reviewCount || 0} reviews</span>
+            </div>
+            {u.platformProfileUrl && (
+              <a href={u.platformProfileUrl} target="_blank" rel="noopener noreferrer" className="player-profile-link">
+                <ExternalLink size={12} /> View on {platformLabel(u.platform)}
+              </a>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================================
+   PROFILE VIEW
+============================================================================ */
+
+function ProfileView({ userId, currentUser, onBack, onOpenGame }) {
+  const [user, setUser] = useState(null);
+  const [games, setGames] = useState([]);
+  const [reviews, setReviews] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      const u = await storageGet(userKey(userId), true);
+      setUser(u);
+      if (u) {
+        const gameKeys = await storageList("games:", true);
+        const allGames = (await storageBulkGet(gameKeys, true)).filter(Boolean);
+        const userGames = allGames.filter(g => g.posterId === userId);
+        setGames(userGames);
+        const reviewKeys = await storageList("reviews:", true);
+        const allReviews = (await storageBulkGet(reviewKeys, true)).filter(Boolean);
+        const userReviews = allReviews.filter(r => r.reviewerId === userId);
+        setReviews(userReviews);
+      }
+      setLoading(false);
+    })();
+  }, [userId]);
+
+  if (loading) return <LoadingRows />;
+  if (!user) return <EmptyState icon={<AlertCircle size={18} />} title="User not found" body="They may have never connected." />;
+
+  const isBanned = user.bannedPermanently || (user.bannedUntil && user.bannedUntil > Date.now());
+
+  return (
+    <div className="view">
+      <button className="back-link" onClick={onBack}><ArrowLeft size={14} /> Back</button>
+      <div className="profile-header">
+        <h2>{user.usernameDisplay}</h2>
+        <PlatformTag platform={user.platform} />
+        <RatingBadge rating={user.rating} variant={user.ratingVariant} />
+        {user.verified ? <span className="badge-mini verified"><CheckCircle2 size={12} /> verified</span> : <span className="badge-mini self-reported">self-reported</span>}
+        {isBanned && <span className="badge-mini banned"><Ban size={12} /> Banned</span>}
+        <a href={user.platformProfileUrl} target="_blank" rel="noopener noreferrer" className="profile-link">
+          <ExternalLink size={14} /> {platformLabel(user.platform)} profile
+        </a>
+      </div>
+
+      <div className="profile-sections">
+        <section>
+          <h3>Submitted games ({games.length})</h3>
+          {games.length === 0 ? <EmptyState icon={<Swords size={16} />} title="No games" body="This user hasn't submitted any games yet." compact /> : (
+            <div className="game-list">
+              {games.map(g => (
+                <GameRow key={g.id} game={g} reviewCount={g.reviewCount || 0} eligible onOpen={onOpenGame} />
+              ))}
+            </div>
+          )}
+        </section>
+        <section>
+          <h3>Reviews written ({reviews.length})</h3>
+          {reviews.length === 0 ? <EmptyState icon={<Sparkles size={16} />} title="No reviews" body="This user hasn't written any reviews yet." compact /> : (
+            <div className="review-list-simple">
+              {reviews.map(r => (
+                <div key={r.gameId} className="review-summary">
+                  <span className="review-summary-text">{r.text.substring(0, 100)}...</span>
+                  <span className="review-summary-meta">on game {r.gameId}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================================
+   LEADERBOARD (uses bulkGet, no per-key fetches)
 ============================================================================ */
 
 function LeaderboardView() {
@@ -1289,15 +1776,17 @@ function LeaderboardView() {
       const reviewKeys = await storageList("reviews:", true);
       const gameKeys = await storageList("games:", true);
       const [allReviews, allGames] = await Promise.all([
-        Promise.all(reviewKeys.map((k) => storageGet(k, true))),
-        Promise.all(gameKeys.map((k) => storageGet(k, true))),
+        storageBulkGet(reviewKeys, true),
+        storageBulkGet(gameKeys, true),
       ]);
+      const reviews = allReviews.filter(Boolean);
+      const games = allGames.filter(Boolean);
       const resolvedCounts = {};
-      for (const g of allGames.filter(Boolean)) {
+      for (const g of games) {
         if (g.resolvedReviewerId) resolvedCounts[g.resolvedReviewerId] = (resolvedCounts[g.resolvedReviewerId] || 0) + 1;
       }
       const byUser = {};
-      for (const r of allReviews.filter(Boolean)) {
+      for (const r of reviews) {
         const key = r.reviewerId;
         if (!byUser[key]) {
           byUser[key] = {
@@ -1318,7 +1807,10 @@ function LeaderboardView() {
         return { ...u, resolved, score };
       });
       list.sort((a, b) => b.score - a.score);
-      if (!cancelled) { setRows(list.slice(0, 20)); setLoading(false); }
+      if (!cancelled) {
+        setRows(list.slice(0, 20));
+        setLoading(false);
+      }
     })();
     return () => { cancelled = true; };
   }, []);
@@ -1350,6 +1842,125 @@ function LeaderboardView() {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+/* ============================================================================
+   ADMIN VIEW
+============================================================================ */
+
+function AdminView({ currentUser, showToast }) {
+  const [reports, setReports] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      const reportKeys = await storageList("reports:", true);
+      const reportList = (await storageBulkGet(reportKeys, true)).filter(Boolean);
+      reportList.sort((a,b) => b.createdAt - a.createdAt);
+      setReports(reportList);
+      const userKeys = await storageList("users:", true);
+      const userList = (await storageBulkGet(userKeys, true)).filter(Boolean);
+      setUsers(userList);
+      setLoading(false);
+    })();
+  }, []);
+
+  const banUser = async (userId, permanent = false, durationDays = 7) => {
+    const user = users.find(u => u.id === userId);
+    if (!user) return;
+    const bannedUntil = permanent ? null : Date.now() + durationDays * 86400000;
+    await storageSet(userKey(userId), {
+      ...user,
+      bannedPermanently: permanent,
+      bannedUntil: bannedUntil,
+    }, true);
+    showToast(`User ${user.usernameDisplay} ${permanent ? 'permanently banned' : `banned for ${durationDays} days`}.`);
+    setUsers(users.map(u => u.id === userId ? { ...u, bannedPermanently: permanent, bannedUntil } : u));
+  };
+
+  const unbanUser = async (userId) => {
+    const user = users.find(u => u.id === userId);
+    if (!user) return;
+    await storageSet(userKey(userId), {
+      ...user,
+      bannedPermanently: false,
+      bannedUntil: null,
+    }, true);
+    showToast(`User ${user.usernameDisplay} unbanned.`);
+    setUsers(users.map(u => u.id === userId ? { ...u, bannedPermanently: false, bannedUntil: null } : u));
+  };
+
+  const closeReport = async (reportId) => {
+    const report = reports.find(r => r.id === reportId);
+    if (!report) return;
+    await storageSet(reportKey(reportId), { ...report, status: 'closed' }, true);
+    setReports(reports.map(r => r.id === reportId ? { ...r, status: 'closed' } : r));
+    showToast("Report marked as handled.");
+  };
+
+  if (loading) return <LoadingRows />;
+
+  return (
+    <div className="view admin-view">
+      <ViewHeader title="Admin Panel" subtitle="Handle reports and manage user bans." />
+      <section>
+        <h3>Open reports ({reports.filter(r => r.status === 'open').length})</h3>
+        <div className="reports-list">
+          {reports.filter(r => r.status === 'open').map(r => (
+            <div key={r.id} className="report-item">
+              <div className="report-info">
+                <span className="report-type">{r.targetType === 'review' ? 'Review' : 'Game'}</span>
+                <span>Reported by {r.reporterUsername}</span>
+                <span className="report-time">{timeAgo(r.createdAt)}</span>
+                {r.targetType === 'review' ? (
+                  <span>Reviewer ID: {r.targetId}</span>
+                ) : (
+                  <span>Game ID: {r.targetId}</span>
+                )}
+                {r.note && <span className="report-note">{r.note}</span>}
+              </div>
+              <div className="report-actions">
+                <button className="link-btn" onClick={() => closeReport(r.id)}>Mark handled</button>
+              </div>
+            </div>
+          ))}
+          {reports.filter(r => r.status === 'open').length === 0 && (
+            <EmptyState icon={<CheckCircle2 size={18} />} title="No open reports" body="Nothing to handle right now." compact />
+          )}
+        </div>
+      </section>
+
+      <section>
+        <h3>User management</h3>
+        <div className="user-management-list">
+          {users.map(u => (
+            <div key={u.id} className="user-management-row">
+              <span className="user-name">{u.usernameDisplay}</span>
+              <span className="user-id">({u.id})</span>
+              {u.bannedPermanently || (u.bannedUntil && u.bannedUntil > Date.now()) ? (
+                <span className="badge-mini banned"><Ban size={10} /> Banned</span>
+              ) : (
+                <span className="badge-mini active">Active</span>
+              )}
+              <div className="user-actions">
+                {!u.bannedPermanently && (!u.bannedUntil || u.bannedUntil <= Date.now()) ? (
+                  <>
+                    <button className="link-btn" onClick={() => banUser(u.id, false, 7)}>Ban 7d</button>
+                    <button className="link-btn" onClick={() => banUser(u.id, false, 30)}>Ban 30d</button>
+                    <button className="link-btn" onClick={() => banUser(u.id, true)}>Ban permanently</button>
+                  </>
+                ) : (
+                  <button className="link-btn" onClick={() => unbanUser(u.id)}>Unban</button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
     </div>
   );
 }
@@ -1440,6 +2051,8 @@ function GlobalStyle() {
       .btn-primary.btn-block { width: 100%; margin-top: 6px; }
       .btn-primary.btn-sm { padding: 6px 12px; font-size: 12.5px; }
       .btn-secondary { background: transparent; border: 1px solid var(--moss); color: var(--moss); padding: 10px 16px; border-radius: 3px; font-size: 13px; }
+      .btn-secondary:hover { background: rgba(76,122,93,0.08); }
+      .btn-group { display:flex; gap: 8px; align-items:center; }
 
       .link-btn { background: none; border: none; color: var(--moss-deep); text-decoration: underline; font-size: 12.5px; padding: 0; margin-right: 10px; }
 
@@ -1466,6 +2079,9 @@ function GlobalStyle() {
       .badge-mini.reviewed { background: rgba(76,122,93,0.12); color: var(--moss-deep); }
       .badge-mini.locked { background: rgba(163,78,54,0.1); color: var(--rust); }
       .badge-mini.self-reported { background: rgba(199,154,75,0.15); color: #8a6a2e; }
+      .badge-mini.admin { background: rgba(76,122,93,0.2); color: var(--moss-deep); }
+      .badge-mini.verified { background: rgba(76,122,93,0.15); color: var(--moss-deep); }
+      .badge-mini.banned { background: rgba(163,78,54,0.15); color: var(--rust); }
 
       /* ---------- shell ---------- */
       .shell { min-height: 100vh; display:flex; flex-direction:column; }
@@ -1488,7 +2104,7 @@ function GlobalStyle() {
       .icon-btn:hover:not(:disabled) { background: rgba(0,0,0,0.06); }
       .icon-btn:disabled { opacity: 0.3; }
 
-      .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--paper); padding: 10px 18px; border-radius: 3px; font-size: 13px; box-shadow: 0 6px 18px rgba(0,0,0,0.25); }
+      .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--paper); padding: 10px 18px; border-radius: 3px; font-size: 13px; box-shadow: 0 6px 18px rgba(0,0,0,0.25); z-index: 100; }
 
       /* ---------- view scaffolding ---------- */
       .view { max-width: 980px; margin: 0 auto; }
@@ -1502,13 +2118,13 @@ function GlobalStyle() {
       .empty-state strong { color: var(--charcoal); font-size: 14px; }
       .empty-state span { font-size: 13px; max-width: 40ch; }
 
-      /* ---------- game list (ledger rows) ---------- */
+      /* ---------- game list ---------- */
       .game-list { border-top: 1px solid var(--paper-dim); }
       .game-row { width: 100%; display:flex; align-items:center; gap: 16px; background: none; border: none; border-bottom: 1px solid var(--paper-dim); padding: 14px 6px; text-align: left; }
       .game-row:hover { background: rgba(76,122,93,0.05); }
       .game-row-rating { font-family: var(--mono); font-weight: 700; font-size: 15px; width: 46px; flex-shrink: 0; }
       .game-row-main { flex: 1; min-width: 0; display:flex; flex-direction:column; gap: 3px; }
-      .game-row-title { display:flex; align-items:center; gap: 8px; font-weight: 600; font-size: 14px; }
+      .game-row-title { display:flex; align-items:center; gap: 8px; font-weight: 600; font-size: 14px; flex-wrap:wrap; }
       .game-row-question { font-family: var(--serif); font-style: italic; color: var(--ink-soft); font-size: 13.5px; white-space: nowrap; overflow:hidden; text-overflow: ellipsis; }
       .game-row-meta { display:flex; flex-direction:column; align-items:flex-end; gap: 4px; flex-shrink:0; }
       .badge-count { font-family: var(--mono); font-size: 11.5px; color: var(--stone); }
@@ -1519,10 +2135,19 @@ function GlobalStyle() {
       .submit-grid { display:grid; grid-template-columns: 1.1fr 0.9fr; gap: 30px; }
       .field-label { display:block; font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--stone); margin: 16px 0 6px; }
       .field-label:first-child { margin-top: 0; }
+      .full-width { width: 100%; padding: 8px 12px; border: 1px solid var(--stone); border-radius: 3px; font-size: 14px; background: #fff; }
       .pgn-input { width:100%; padding: 12px; border: 1px solid var(--stone); border-radius: 3px; font-family: var(--mono); font-size: 13px; resize: vertical; background: #fff; }
       .question-input { width:100%; padding: 12px; border: 1px solid var(--stone); border-radius: 3px; font-family: var(--serif); font-size: 14px; resize: vertical; background: #fff; }
       .preview-col { background: var(--paper-dim); border-radius: 4px; padding: 16px; }
       .parse-warning { display:flex; gap:6px; align-items:flex-start; font-size: 12px; color: var(--stone); margin-top: 10px; }
+
+      .game-picker { display:flex; flex-direction:column; gap: 8px; max-height: 300px; overflow-y:auto; }
+      .game-picker-item { display:flex; justify-content:space-between; align-items:center; padding: 10px 14px; background: #fff; border: 1px solid var(--paper-dim); border-radius: 3px; cursor:pointer; text-align:left; }
+      .game-picker-item:hover { border-color: var(--moss); }
+      .game-picker-item.selected { border-color: var(--moss); background: rgba(76,122,93,0.05); }
+      .gpi-players { font-weight:600; font-size:13px; }
+      .gpi-result { font-family: var(--mono); font-size:12px; color: var(--stone); }
+      .gpi-date { font-family: var(--mono); font-size:11px; color: var(--stone); }
 
       /* ---------- board ---------- */
       .board { display:flex; flex-direction:column; width: 100%; max-width: 420px; aspect-ratio: 1; border: 1px solid var(--charcoal); }
@@ -1545,8 +2170,9 @@ function GlobalStyle() {
       .move-list { display:flex; flex-direction:column; gap: 2px; margin-top: 12px; max-height: 220px; overflow-y:auto; border-top: 1px solid var(--paper-dim); padding-top: 8px; }
       .move-list-row { display:flex; align-items:center; gap: 8px; font-family: var(--mono); font-size: 13px; }
       .move-list-num { color: var(--stone); width: 26px; flex-shrink:0; }
-      .move-list-san { background:none; border:none; padding: 2px 6px; border-radius: 2px; color: var(--charcoal); }
+      .move-list-san { background:none; border:none; padding: 2px 6px; border-radius: 2px; color: var(--charcoal); position:relative; }
       .move-list-san.active { background: var(--moss); color: var(--paper); }
+      .ann-dot { position:absolute; top:2px; right:2px; width: 6px; height:6px; border-radius:50%; background: var(--gold); }
       .pgn-raw { background: var(--paper-dim); border-radius: 4px; padding: 14px; max-height: 300px; overflow:auto; }
       .pgn-raw pre { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; margin:0; }
 
@@ -1561,18 +2187,29 @@ function GlobalStyle() {
       .question-block p { font-family: var(--serif); font-size: 15px; line-height: 1.5; margin: 0; }
       .reviews-block .field-label { margin-top: 0; }
 
-      .review-card { border: 1px solid var(--paper-dim); border-radius: 4px; padding: 14px 16px; margin-bottom: 12px; background: #fff; }
+      .review-card { border: 1px solid var(--paper-dim); border-radius: 4px; padding: 14px 16px; margin-bottom: 12px; background: #fff; position:relative; }
       .review-card.resolved { border-color: var(--gold); background: rgba(199,154,75,0.06); }
       .review-head { display:flex; align-items:center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
       .review-author { display:flex; align-items:center; gap:7px; font-weight:600; font-size: 13.5px; }
       .review-time { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--stone); }
       .resolved-flag { display:flex; align-items:center; gap:6px; font-size: 12px; color: #8a6a2e; margin-bottom: 8px; }
       .review-text { font-size: 14px; line-height: 1.55; margin: 0 0 10px; white-space: pre-wrap; }
+      .review-annotations { margin: 8px 0; font-size: 13px; }
+      .ann-label { display:flex; align-items:center; gap:4px; font-weight:600; color: var(--moss-deep); margin-bottom:4px; }
+      .review-annotations ul { list-style:none; padding-left: 0; margin: 4px 0; }
+      .review-annotations li { margin-bottom: 4px; }
+      .ann-ply { font-family: var(--mono); font-size: 11px; color: var(--stone); margin-right: 4px; }
+      .ann-comment { color: var(--charcoal); }
+      .ann-variation-moves { font-family: var(--mono); background: var(--paper-dim); padding: 1px 4px; border-radius: 2px; }
+
       .review-actions { display:flex; align-items:center; gap: 4px; }
       .upvote-btn { display:flex; align-items:center; gap:5px; background:none; border: 1px solid var(--stone); border-radius: 12px; padding: 3px 10px; font-size: 12px; color: var(--ink-soft); margin-right: auto; }
       .upvote-btn.voted { border-color: var(--moss); color: var(--moss-deep); background: rgba(76,122,93,0.08); }
       .upvote-btn:disabled { opacity: 0.5; cursor: default; }
       .resolve-btn { color: var(--moss-deep); }
+
+      .report-btn { background:none; border:none; color: var(--stone); cursor:pointer; padding: 2px 4px; margin-left:auto; }
+      .report-btn:hover { color: var(--rust); }
 
       .review-edit textarea { width:100%; padding: 10px; border: 1px solid var(--stone); border-radius: 3px; font-size: 14px; font-family: inherit; }
       .review-edit-row { display:flex; align-items:center; justify-content:space-between; margin-top: 8px; gap: 8px; flex-wrap: wrap; }
@@ -1583,7 +2220,31 @@ function GlobalStyle() {
       .review-form { border-top: 1px solid var(--paper-dim); padding-top: 14px; margin-top: 8px; }
       .review-form textarea { width:100%; padding: 12px; border: 1px solid var(--stone); border-radius: 3px; font-size: 14px; font-family: inherit; resize: vertical; }
 
+      .review-editor-container { margin-top: 12px; }
+      .review-editor { display:flex; gap: 20px; }
+      .board-container { flex:1; }
+      .annotation-panel { flex:1; display:flex; flex-direction:column; gap:10px; }
+      .annotation-actions textarea { width:100%; padding:8px; }
+      .variation-input-area { display:flex; flex-direction:column; gap:6px; margin-top:4px; }
+      .variation-input-area input { padding:6px; }
+      .variation-preview { font-family: var(--mono); font-size:12px; }
+
       .gap-notice { display:flex; gap:8px; align-items:flex-start; font-size: 12.5px; color: var(--stone); background: var(--paper-dim); border-radius: 3px; padding: 10px 12px; margin-top: 10px; }
+
+      /* ---------- players ---------- */
+      .players-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
+      .player-card { background: #fff; border: 1px solid var(--paper-dim); border-radius: 4px; padding: 16px; cursor:pointer; transition: border-color 0.2s; }
+      .player-card:hover { border-color: var(--moss); }
+      .player-card-header { display:flex; align-items:center; gap: 8px; margin-bottom: 8px; }
+      .player-name { font-weight:600; font-size: 14px; }
+      .player-stats { display:flex; gap: 12px; margin: 8px 0; font-size: 12.5px; color: var(--ink-soft); }
+      .player-profile-link { display:inline-flex; align-items:center; gap:4px; font-size: 12px; color: var(--moss-deep); }
+
+      /* ---------- profile view ---------- */
+      .profile-header { display:flex; align-items:center; gap: 10px; flex-wrap: wrap; margin-bottom: 24px; }
+      .profile-link { display:inline-flex; align-items:center; gap:4px; font-size: 12px; color: var(--moss-deep); }
+      .profile-sections section { margin-bottom: 30px; }
+      .review-summary { padding: 8px 0; border-bottom: 1px solid var(--paper-dim); }
 
       /* ---------- leaderboard ---------- */
       .leaderboard-list { border-top: 1px solid var(--paper-dim); }
@@ -1595,8 +2256,21 @@ function GlobalStyle() {
       .lb-stats { font-family: var(--mono); font-size: 11.5px; color: var(--stone); }
       .lb-score { font-family: var(--mono); font-weight: 700; font-size: 15px; color: var(--moss-deep); width: 40px; text-align: right; }
 
+      /* ---------- admin ---------- */
+      .admin-view section { margin-bottom: 30px; }
+      .reports-list { display:flex; flex-direction:column; gap: 8px; }
+      .report-item { background: #fff; border: 1px solid var(--paper-dim); border-radius: 4px; padding: 12px; display:flex; justify-content:space-between; align-items:center; }
+      .report-info { display:flex; flex-wrap:wrap; gap: 8px; align-items:center; font-size: 13px; }
+      .report-type { font-weight:600; text-transform: uppercase; font-size: 11px; color: var(--moss-deep); }
+      .report-time { font-family: var(--mono); font-size: 11px; color: var(--stone); }
+      .user-management-list { display:flex; flex-direction:column; gap: 8px; }
+      .user-management-row { background: #fff; border: 1px solid var(--paper-dim); border-radius: 4px; padding: 12px; display:flex; align-items:center; gap: 12px; flex-wrap: wrap; }
+      .user-name { font-weight:600; }
+      .user-id { font-family: var(--mono); font-size: 11px; color: var(--stone); }
+      .user-actions { display:flex; gap: 6px; margin-left:auto; }
+
       @media (max-width: 760px) {
-        .submit-grid, .detail-grid { grid-template-columns: 1fr; }
+        .submit-grid, .detail-grid, .review-editor { grid-template-columns: 1fr; flex-direction: column; }
         .content { padding: 20px 14px 50px; }
         .shell-header { padding: 12px 16px; }
         .game-row { flex-wrap: wrap; }
